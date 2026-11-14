@@ -94,6 +94,7 @@ def write_pack(object_ids):
 
 
 PACK_CACHE = {}
+PACK_FRAME_CACHE = {}
 PACK_CACHE_LOCK = threading.Lock()
 PACK_CACHE_MAX = 48
 
@@ -118,6 +119,34 @@ def cached_pack(ids):
             if len(PACK_CACHE) < PACK_CACHE_MAX:
                 PACK_CACHE[key] = hit
     return hit
+
+
+def cached_pack_framed(ids):
+    """Return (pack, sideband_stream(pack)), both memoised by object set.
+
+    The framed bytes are a pure function of the pack, and the pack is a pure
+    function of the sorted object set, so the sideband re-framing can be kept
+    alongside it.  Same key, same lock, same bound: a repeated fetch of one
+    object set pays neither the compression nor the re-framing again, and two
+    threads racing on a cold entry cannot both build it.
+    """
+    key = tuple(ids)
+    pack = PACK_CACHE.get(key)
+    framed = PACK_FRAME_CACHE.get(key)
+    if pack is not None and framed is not None:
+        return pack, framed
+    with PACK_CACHE_LOCK:
+        pack = PACK_CACHE.get(key)
+        if pack is None:
+            pack = write_pack(list(key))
+            if len(PACK_CACHE) < PACK_CACHE_MAX:
+                PACK_CACHE[key] = pack
+        framed = PACK_FRAME_CACHE.get(key)
+        if framed is None:
+            framed = sideband_stream(pack)
+            if len(PACK_FRAME_CACHE) < PACK_CACHE_MAX:
+                PACK_FRAME_CACHE[key] = framed
+    return pack, framed
 
 
 def apply_delta(base, delta):
@@ -534,15 +563,15 @@ def fetch_lines(repo, wants, haves, shallow, depth):
         known = shallow_objects([h for h in haves if STORE.has(h)])
         send = shallow_objects(list(levels))
         send -= known
-        pack = cached_pack(sorted(send))
+        _pack, framed = cached_pack_framed(sorted(send))
     else:
         want_set = commit_closure(wants)
         have_set = commit_closure([h for h in haves if STORE.has(h)])
-        pack = cached_pack(sorted(want_set - have_set))
+        _pack, framed = cached_pack_framed(sorted(want_set - have_set))
 
     out.append("packfile\n")
     head = pkt_lines(out)
-    return head + sideband_stream(pack) + FLUSH
+    return head + framed + FLUSH
 
 
 def handle_receive_pack(repo, body_raw):
