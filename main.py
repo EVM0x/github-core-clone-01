@@ -2027,6 +2027,9 @@ Handler.git = git_dispatch
 # --------------------------------------------------------------------------- MCP (streamable HTTP)
 
 MCP_VERSION = "2025-06-18"
+# Revisions this server speaks, newest first. server/discover reports the list;
+# a client that only knows an older handshake still gets an answer from initialize.
+MCP_REVISIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 
 
 def mcp_tools():
@@ -2070,6 +2073,27 @@ def mcp_tools():
 
 TOOLS = mcp_tools()
 TOOL_INDEX = {tool["name"]: tool for tool in TOOLS}
+
+
+def resolve_tool_name(name):
+    """A server prefix is allowed and the match is case-insensitive.
+
+    github__create_issue and GitHub__Create_Issue both mean create_issue, which is
+    what github-mcp-server sends when it is running behind a proxy.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    if name in TOOL_INDEX:
+        return name
+    wanted = name.lower()
+    for candidate in TOOL_INDEX:
+        if wanted == candidate.lower():
+            return candidate
+    suffix = wanted.rsplit("__", 1)[-1]
+    for candidate in TOOL_INDEX:
+        if suffix == candidate.lower():
+            return candidate
+    return None
 
 
 def mcp_text(payload, is_error=False):
@@ -2148,11 +2172,17 @@ def mcp_handle(payload):
         return {"jsonrpc": "2.0", "id": request_id, "result": {}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+    if method == "server/discover":
+        return {"jsonrpc": "2.0", "id": request_id,
+                "result": {"supportedVersions": list(MCP_REVISIONS),
+                           "protocolVersion": MCP_REVISIONS[0],
+                           "capabilities": {"tools": {"listChanged": False}},
+                           "serverInfo": {"name": "forge", "version": "1.0.0"}}}
     if method == "tools/call":
-        name = params.get("name") or ""
-        if name not in TOOL_INDEX:
+        name = resolve_tool_name(params.get("name"))
+        if name is None:
             return {"jsonrpc": "2.0", "id": request_id,
-                    "error": {"code": -32602, "message": "Unknown tool: %s" % name}}
+                    "error": {"code": -32602, "message": "Unknown tool: %s" % (params.get("name") or "")}}
         result, _ = mcp_call(name, params.get("arguments") or {})
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     return {"jsonrpc": "2.0", "id": request_id,
@@ -2259,6 +2289,7 @@ class GQLParser:
     def __init__(self, text):
         self.tokens = gql_tokens(text)
         self.pos = 0
+        self.fragments = {}
 
     def peek(self, offset=0):
         index = self.pos + offset
@@ -2286,6 +2317,14 @@ class GQLParser:
         operations = []
         while self.pos < len(self.tokens):
             token = self.peek()
+            # Anonymous shorthand: a document that opens on a selection set is a
+            # query with no name and no variables. gh and the MCP server both
+            # send introspection this way.
+            if token[0] == "punct" and token[1] == "{":
+                operations.append({"type": "query", "name": None, "variables": {},
+                                   "selections": self.parse_selection_set(),
+                                   "directives": [], "fragments": self.fragments})
+                continue
             if token[0] != "name":
                 raise GQLError("expected an operation")
             keyword = token[1]
@@ -2294,7 +2333,7 @@ class GQLParser:
                 name = self.expect("name")[1]
                 self.expect("name", "on")
                 self.expect("name")
-                fragments[name] = self.parse_selection_set()
+                self.fragments[name] = self.parse_selection_set()
                 continue
             self.next()
             operation_type = keyword if keyword in ("query", "mutation", "subscription") else "query"
@@ -2317,7 +2356,8 @@ class GQLParser:
             directives = self.parse_directives()
             selections = self.parse_selection_set()
             operations.append({"type": operation_type, "name": name, "variables": variables,
-                               "selections": selections, "directives": directives})
+                               "selections": selections, "directives": directives,
+                               "fragments": self.fragments})
         return operations
 
     def parse_type(self):
@@ -2412,9 +2452,6 @@ class GQLParser:
         return selections
 
 
-fragments = {}
-
-
 def gql_value(node, variables):
     kind, payload = node
     if kind == "var":
@@ -2428,11 +2465,12 @@ def gql_value(node, variables):
     return payload
 
 
-def expand(selections, variables):
+def expand(selections, variables, fragments=None):
+    fragments = fragments or {}
     out = []
     for selection in selections:
         if selection["kind"] == "fragment":
-            out.extend(expand(fragments.get(selection["name"], []), variables))
+            out.extend(expand(fragments.get(selection["name"], []), variables, fragments))
         elif selection["kind"] == "inline":
             out.append(selection)
         else:
@@ -2500,12 +2538,14 @@ def gql_pull(repo, pull):
     return {"__type": "PullRequest", "repo": repo, "pull": pull}
 
 
-def connection(nodes, has_next=False, end_cursor=None):
+def connection(nodes, has_next=False, end_cursor=None, total=None):
+    # totalCount is the size of the whole connection; only the window was passed
+    # in before, so a paged read reported its page size as the total.
     return {"__type": "Connection", "nodes": nodes,
             "pageInfo": {"__type": "PageInfo", "hasNextPage": has_next,
                          "hasPreviousPage": False, "endCursor": end_cursor,
                          "startCursor": end_cursor},
-            "totalCount": len(nodes)}
+            "totalCount": len(nodes) if total is None else total}
 
 
 def connection_slice(items, args, wrap):
@@ -2522,7 +2562,7 @@ def connection_slice(items, args, wrap):
     window = items[start : start + first]
     has_next = start + first < len(items)
     cursor = base64.b64encode(("cursor:%d" % (start + len(window))).encode()).decode() if window else None
-    return connection([wrap(item) for item in window], has_next, cursor)
+    return connection([wrap(item) for item in window], has_next, cursor, len(items))
 
 
 def resolve_field(type_name, obj, name, args, ctx):
@@ -2637,13 +2677,24 @@ def resolve_repository_field(repo, name, args, ctx):
     if name == "url":
         return ("%s/%s" % (ctx["base_url"], repo.full_name), None)
     if name in ("createdAt", "updatedAt"):
-        return (iso_time(repo.seq), None)
+        return (iso(BASE_EPOCH + repo.seq * 60), None)
     if name == "issues":
         wanted = args.get("states")
         states = [state_upper(item) for item in wanted] if isinstance(wanted, list) else None
         items = [issue for issue in repo.issues
                  if states is None or state_upper(issue["state"]) in states]
-        items = list(reversed(items))
+        order = args.get("orderBy")
+        if isinstance(order, dict):
+            field = str(order.get("field") or "CREATED_AT").upper()
+            descending = str(order.get("direction") or "DESC").upper() != "ASC"
+            key = "updated" if field == "UPDATED_AT" else "created"
+            # Ties break by number DESC in both directions, so a stable sort on
+            # the number first and the chosen field second gives the same answer
+            # for either direction.
+            items.sort(key=lambda issue: issue["number"], reverse=True)
+            items.sort(key=lambda issue: issue.get(key) or 0, reverse=descending)
+        else:
+            items = list(reversed(items))
         return (connection_slice(items, args, lambda issue: gql_issue(repo, issue)), "Connection")
     if name == "issue":
         issue = find_issue(repo, args.get("number"))
@@ -2686,10 +2737,12 @@ def resolve_issue_field(repo, issue, name, args, ctx):
         return (connection([]), "Connection")
     if name == "url":
         return ("%s/%s/issues/%d" % (ctx["base_url"], repo.full_name, issue["number"]), None)
-    if name in ("createdAt", "updatedAt"):
-        return (iso_time(issue["created"]), None)
+    if name == "createdAt":
+        return (iso(issue["created"]), None)
+    if name == "updatedAt":
+        return (iso(issue["updated"]), None)
     if name == "closedAt":
-        return (iso_time(issue["updated"]) if issue["state"] == "closed" else None, None)
+        return (iso(issue["updated"]) if issue["state"] == "closed" else None, None)
     if name == "locked":
         return (False, None)
     raise GQLError('Cannot query field "%s" on type "Issue".' % name)
@@ -2717,7 +2770,7 @@ def resolve_pull_field(repo, pull, name, args, ctx):
     if name == "merged":
         return (bool(pull["merged"]), None)
     if name == "mergedAt":
-        return (iso_time(pull["merged_epoch"]) if pull["merged_epoch"] else None, None)
+        return (iso(pull["merged_epoch"]) if pull["merged_epoch"] else None, None)
     if name == "isDraft":
         return (False, None)
     if name == "author":
@@ -2733,7 +2786,7 @@ def resolve_pull_field(repo, pull, name, args, ctx):
     if name == "baseRefOid":
         return (repo.refs.get("refs/heads/" + pull["base"]), None)
     if name in ("createdAt", "updatedAt"):
-        return (iso_time(pull["created"]), None)
+        return (iso(pull["created"]), None)
     if name == "url":
         return ("%s/%s/pull/%d" % (ctx["base_url"], repo.full_name, pull["number"]), None)
     raise GQLError('Cannot query field "%s" on type "PullRequest".' % name)
@@ -2810,7 +2863,7 @@ PAYLOAD_FIELDS = {
 def complete(type_name, value, selections, ctx):
     if value is None:
         return None
-    selections = expand(selections, ctx["vars"])
+    selections = expand(selections, ctx["vars"], ctx.get("fragments"))
     if not selections:
         return value
     if isinstance(value, list):
@@ -2857,16 +2910,12 @@ def complete(type_name, value, selections, ctx):
     return out
 
 
-def iso_time(seed):
-    seconds = 1600000000 + (int(seed or 0) * 60)
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
-
-
 def run_operation(operation, variables, base_url):
-    ctx = {"vars": variables, "errors": [], "path": [], "base_url": base_url}
+    ctx = {"vars": variables, "errors": [], "path": [], "base_url": base_url,
+           "fragments": operation.get("fragments") or {}}
     root = "Mutation" if operation["type"] == "mutation" else "Query"
     data = {}
-    for selection in expand(operation["selections"], variables):
+    for selection in expand(operation["selections"], variables, ctx["fragments"]):
         if selection["kind"] == "inline":
             continue
         field = selection["name"]
