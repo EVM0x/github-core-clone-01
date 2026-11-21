@@ -2,6 +2,9 @@
 # --------------------------------------------------------------------------- MCP (streamable HTTP)
 
 MCP_VERSION = "2025-06-18"
+# Revisions this server speaks, newest first. server/discover reports the list;
+# a client that only knows an older handshake still gets an answer from initialize.
+MCP_REVISIONS = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 
 
 def mcp_tools():
@@ -45,6 +48,27 @@ def mcp_tools():
 
 TOOLS = mcp_tools()
 TOOL_INDEX = {tool["name"]: tool for tool in TOOLS}
+
+
+def resolve_tool_name(name):
+    """A server prefix is allowed and the match is case-insensitive.
+
+    github__create_issue and GitHub__Create_Issue both mean create_issue, which is
+    what github-mcp-server sends when it is running behind a proxy.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    if name in TOOL_INDEX:
+        return name
+    wanted = name.lower()
+    for candidate in TOOL_INDEX:
+        if wanted == candidate.lower():
+            return candidate
+    suffix = wanted.rsplit("__", 1)[-1]
+    for candidate in TOOL_INDEX:
+        if suffix == candidate.lower():
+            return candidate
+    return None
 
 
 def mcp_text(payload, is_error=False):
@@ -123,11 +147,17 @@ def mcp_handle(payload):
         return {"jsonrpc": "2.0", "id": request_id, "result": {}}
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
+    if method == "server/discover":
+        return {"jsonrpc": "2.0", "id": request_id,
+                "result": {"supportedVersions": list(MCP_REVISIONS),
+                           "protocolVersion": MCP_REVISIONS[0],
+                           "capabilities": {"tools": {"listChanged": False}},
+                           "serverInfo": {"name": "forge", "version": "1.0.0"}}}
     if method == "tools/call":
-        name = params.get("name") or ""
-        if name not in TOOL_INDEX:
+        name = resolve_tool_name(params.get("name"))
+        if name is None:
             return {"jsonrpc": "2.0", "id": request_id,
-                    "error": {"code": -32602, "message": "Unknown tool: %s" % name}}
+                    "error": {"code": -32602, "message": "Unknown tool: %s" % (params.get("name") or "")}}
         result, _ = mcp_call(name, params.get("arguments") or {})
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
     return {"jsonrpc": "2.0", "id": request_id,
